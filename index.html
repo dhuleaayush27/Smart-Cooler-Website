@@ -1,0 +1,228 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Cooler Control</title>
+<style>
+*{box-sizing:border-box}
+body{
+  margin:0;padding:20px;
+  font-family:Arial,sans-serif;
+  background:#101827;color:#fff
+}
+.container{max-width:600px;margin:auto}
+h1{font-size:26px;margin-bottom:5px}
+.sub{color:#9caec5;margin-top:0}
+.card{
+  background:#1c293c;padding:20px;
+  border-radius:16px;margin:16px 0
+}
+.label{color:#aabbd0;font-size:14px}
+.value{font-size:42px;font-weight:bold;margin:10px 0}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.status{font-size:18px;margin-top:10px}
+input[type=number]{
+  width:100%;padding:13px;border:0;
+  border-radius:9px;margin:10px 0;
+  font-size:18px;background:#fff;color:#111
+}
+button{
+  width:100%;padding:14px;border:0;
+  border-radius:10px;margin-top:10px;
+  font-size:16px;font-weight:bold;
+  background:#168bdb;color:white
+}
+button.secondary{background:#35465e}
+button:disabled{opacity:.5}
+.note{font-size:13px;color:#aabbd0;line-height:1.5}
+#message{color:#ffd166;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>❄ SMART COOLER</h1>
+  <p class="sub">Arduino Temperature Control System</p>
+
+  <div class="card">
+    <div class="label">LIVE TEMPERATURE</div>
+    <div class="value" id="temp">-- °C</div>
+    <div class="status" id="connection">● Not connected</div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">FAN STATUS</div>
+      <div class="status" id="fan">--</div>
+    </div>
+    <div class="card">
+      <div class="label">WATER PUMP</div>
+      <div class="status" id="pump">--</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Temperature Settings</h3>
+    <label class="label" for="low">Lower temperature limit (°C)</label>
+    <input id="low" type="number" min="15" max="35" value="27">
+
+    <label class="label" for="high">Upper temperature limit (°C)</label>
+    <input id="high" type="number" min="20" max="45" value="36">
+
+    <button id="save" disabled>Save Temperature Settings</button>
+    <p class="note">
+      Below lower limit: Pump OFF<br>
+      Between limits: Pump cycles<br>
+      At or above upper limit: Pump continuously ON
+    </p>
+  </div>
+
+  <div class="card">
+    <h3>USB Connection</h3>
+    <button id="connect">Connect Arduino</button>
+    <button id="disconnect" class="secondary" disabled>
+      Disconnect
+    </button>
+    <p id="message">Connect your Arduino using USB OTG.</p>
+  </div>
+
+  <p class="note">
+    USB communication requires a compatible Chrome version,
+    Android device and USB serial driver.
+  </p>
+</div>
+
+<script>
+let port = null;
+let writer = null;
+let reader = null;
+let reading = false;
+
+const $ = id => document.getElementById(id);
+
+function message(text) {
+  $("message").textContent = text;
+}
+
+async function connectArduino() {
+  if (!("serial" in navigator)) {
+    message("USB Serial is not supported by this browser/device. The dashboard can still be viewed.");
+    return;
+  }
+
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 9600 });
+
+    writer = port.writable.getWriter();
+    reader = port.readable.getReader();
+    reading = true;
+
+    $("connection").textContent = "● Connected";
+    $("connection").style.color = "#42df91";
+    $("connect").disabled = true;
+    $("disconnect").disabled = false;
+    $("save").disabled = false;
+    message("Arduino connected. Waiting for temperature data...");
+
+    readData();
+  } catch (error) {
+    message("Connection error: " + error.message);
+  }
+}
+
+async function readData() {
+  let buffer = "";
+
+  try {
+    while (reading && reader) {
+      const result = await reader.read();
+      if (result.done) break;
+
+      buffer += new TextDecoder().decode(result.value);
+
+      let lines = buffer.split("\n");
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        processData(line.trim());
+      }
+    }
+  } catch (error) {
+    message("Reading stopped: " + error.message);
+  }
+}
+
+function processData(line) {
+  // Expected format: DATA,temperature,fan,pump
+  const parts = line.split(",");
+
+  if (parts[0] === "DATA" && parts.length >= 4) {
+    $("temp").textContent = Number(parts[1]).toFixed(1) + " °C";
+    $("fan").textContent = parts[2] === "1" ? "ON" : "OFF";
+    $("pump").textContent = parts[3] === "1" ? "ON" : "OFF";
+  }
+}
+
+async function saveSettings() {
+  const low = Number($("low").value);
+  const high = Number($("high").value);
+
+  if (!Number.isFinite(low) || !Number.isFinite(high) ||
+      low < 15 || low > 35 || high < 20 || high > 45 ||
+      low >= high) {
+    message("Enter valid limits. Lower limit must be less than upper limit.");
+    return;
+  }
+
+  if (!writer) {
+    message("Connect Arduino first.");
+    return;
+  }
+
+  try {
+    await writer.write(
+      new TextEncoder().encode(`SET,${low},${high}\n`)
+    );
+    message("Settings command sent. Waiting for Arduino confirmation.");
+  } catch (error) {
+    message("Could not send settings: " + error.message);
+  }
+}
+
+async function disconnectArduino() {
+  reading = false;
+
+  try {
+    if (reader) {
+      await reader.cancel();
+      reader.releaseLock();
+      reader = null;
+    }
+    if (writer) {
+      writer.releaseLock();
+      writer = null;
+    }
+    if (port) {
+      await port.close();
+      port = null;
+    }
+  } catch (error) {
+    message("Disconnect: " + error.message);
+  }
+
+  $("connection").textContent = "● Not connected";
+  $("connection").style.color = "#fff";
+  $("connect").disabled = false;
+  $("disconnect").disabled = true;
+  $("save").disabled = true;
+  message("Arduino disconnected.");
+}
+
+$("connect").addEventListener("click", connectArduino);
+$("disconnect").addEventListener("click", disconnectArduino);
+$("save").addEventListener("click", saveSettings);
+</script>
+</body>
+</html>
