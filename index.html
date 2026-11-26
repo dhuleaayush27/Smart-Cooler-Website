@@ -94,10 +94,14 @@ button:disabled{opacity:.5}
 </div>
 
 <script>
-let port = null;
-let writer = null;
-let reader = null;
+
+let device = null;
+let interfaceNumber = 0;
+let endpointIn = 0;
+let endpointOut = 0;
 let reading = false;
+let buffer = "";
+let writerBusy = false;
 
 const $ = id => document.getElementById(id);
 
@@ -105,44 +109,150 @@ function message(text) {
   $("message").textContent = text;
 }
 
+function setConnected(connected) {
+  $("connection").textContent =
+    connected ? "● Connected" : "● Not connected";
+  $("connection").style.color =
+    connected ? "#42df91" : "#fff";
+
+  $("connect").disabled = connected;
+  $("disconnect").disabled = !connected;
+  $("save").disabled = !connected;
+}
+
+async function control(request, value, index) {
+  const result = await device.controlTransferOut({
+    requestType: "vendor",
+    recipient: "device",
+    request,
+    value,
+    index
+  });
+
+  if (result.status !== "ok") {
+    throw new Error("CH340 control request failed");
+  }
+}
+
+function ch341Divisor(baud) {
+  const CLK = 48000000;
+  let fact = 1, ps;
+
+  const minRate = [
+    CLK / (4096 * 512),
+    CLK / (512 * 512),
+    CLK / (64 * 512),
+    CLK / (8 * 512)
+  ];
+
+  for (ps = 3; ps >= 0; ps--) {
+    if (baud > minRate[ps]) break;
+  }
+
+  if (ps < 0) ps = 0;
+
+  let clkDiv = 1 << (12 - 3 * ps - fact);
+  let div = Math.floor(CLK / (clkDiv * baud));
+
+  if (div < 9 || div > 255) {
+    fact = 0;
+    clkDiv = 1 << (12 - 3 * ps);
+    div = Math.floor(CLK / (clkDiv * baud));
+  }
+
+  return ((((0x100 - div) & 255) << 8) |
+          (fact << 2) | ps) & 65535;
+}
+
+async function initializeCH340() {
+  await control(0xA1, 0x0000, 0x0000);
+  await control(0x9A, 0x1312, ch341Divisor(9600));
+  await control(0x9A, 0x2518, 0x00C3);
+}
+
 async function connectArduino() {
-  if (!("serial" in navigator)) {
-    message("USB Serial is not supported by this browser/device. The dashboard can still be viewed.");
+  if (!("usb" in navigator)) {
+    message("WebUSB is unavailable in this browser.");
     return;
   }
 
   try {
-    port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 9600 });
+    message("Searching for CH340 Arduino...");
 
-    writer = port.writable.getWriter();
-    reader = port.readable.getReader();
+    device = await navigator.usb.requestDevice({
+      filters: [{ vendorId: 0x1A86 }]
+    });
+
+    await device.open();
+
+    if (device.configuration === null) {
+      await device.selectConfiguration(1);
+    }
+
+    const iface = device.configuration.interfaces.find(
+      item => item.alternates.some(alt =>
+        alt.endpoints.length >= 2
+      )
+    );
+
+    if (!iface) {
+      throw new Error("USB serial interface not found.");
+    }
+
+    interfaceNumber = iface.interfaceNumber;
+
+    await device.claimInterface(interfaceNumber);
+
+    const alt = iface.alternates[0];
+
+    endpointIn = 0;
+    endpointOut = 0;
+
+    for (const ep of alt.endpoints) {
+      if (ep.direction === "in") endpointIn = ep.endpointNumber;
+      if (ep.direction === "out") endpointOut = ep.endpointNumber;
+    }
+
+    if (!endpointIn || !endpointOut) {
+      throw new Error("USB data endpoints not found.");
+    }
+
+    await initializeCH340();
+
     reading = true;
-
-    $("connection").textContent = "● Connected";
-    $("connection").style.color = "#42df91";
-    $("connect").disabled = true;
-    $("disconnect").disabled = false;
-    $("save").disabled = false;
-    message("Arduino connected. Waiting for temperature data...");
+    setConnected(true);
+    message("CH340 connected. Waiting for temperature...");
 
     readData();
+
   } catch (error) {
-    message("Connection error: " + error.message);
+    message("Connection failed: " + error.message);
+
+    try {
+      if (device && device.opened) {
+        await device.close();
+      }
+    } catch (_) {}
+
+    device = null;
+    setConnected(false);
   }
 }
 
 async function readData() {
-  let buffer = "";
+  const decoder = new TextDecoder();
 
   try {
-    while (reading && reader) {
-      const result = await reader.read();
-      if (result.done) break;
+    while (reading && device && device.opened) {
+      const result = await device.transferIn(endpointIn, 64);
 
-      buffer += new TextDecoder().decode(result.value);
+      if (result.status !== "ok" || !result.data) {
+        continue;
+      }
 
-      let lines = buffer.split("\n");
+      buffer += decoder.decode(result.data);
+
+      const lines = buffer.split(/\r?\n/);
       buffer = lines.pop();
 
       for (const line of lines) {
@@ -150,18 +260,35 @@ async function readData() {
       }
     }
   } catch (error) {
-    message("Reading stopped: " + error.message);
+    if (reading) {
+      message("USB reading error: " + error.message);
+      await disconnectArduino();
+    }
   }
 }
 
 function processData(line) {
-  // Expected format: DATA,temperature,fan,pump
   const parts = line.split(",");
 
   if (parts[0] === "DATA" && parts.length >= 4) {
-    $("temp").textContent = Number(parts[1]).toFixed(1) + " °C";
+    const temp = Number(parts[1]);
+
+    if (!Number.isFinite(temp)) {
+      $("temp").textContent = "-- °C";
+      return;
+    }
+
+    $("temp").textContent = temp.toFixed(1) + " °C";
     $("fan").textContent = parts[2] === "1" ? "ON" : "OFF";
     $("pump").textContent = parts[3] === "1" ? "ON" : "OFF";
+  }
+
+  if (line === "SET,OK") {
+    message("Temperature settings saved successfully!");
+  }
+
+  if (line === "SET,ERROR") {
+    message("Arduino rejected the temperature settings.");
   }
 }
 
@@ -170,24 +297,38 @@ async function saveSettings() {
   const high = Number($("high").value);
 
   if (!Number.isFinite(low) || !Number.isFinite(high) ||
-      low < 15 || low > 35 || high < 20 || high > 45 ||
+      low < 15 || low > 35 ||
+      high < 20 || high > 45 ||
       low >= high) {
-    message("Enter valid limits. Lower limit must be less than upper limit.");
+    message("Enter valid temperature limits.");
     return;
   }
 
-  if (!writer) {
+  if (!device || !device.opened) {
     message("Connect Arduino first.");
     return;
   }
 
+  if (writerBusy) return;
+  writerBusy = true;
+
   try {
-    await writer.write(
-      new TextEncoder().encode(`SET,${low},${high}\n`)
+    const data = new TextEncoder().encode(
+      `SET,${low},${high}\n`
     );
-    message("Settings command sent. Waiting for Arduino confirmation.");
+
+    const result = await device.transferOut(endpointOut, data);
+
+    if (result.status !== "ok") {
+      throw new Error("USB write failed.");
+    }
+
+    message("Settings sent. Waiting for confirmation...");
+
   } catch (error) {
     message("Could not send settings: " + error.message);
+  } finally {
+    writerBusy = false;
   }
 }
 
@@ -195,28 +336,17 @@ async function disconnectArduino() {
   reading = false;
 
   try {
-    if (reader) {
-      await reader.cancel();
-      reader.releaseLock();
-      reader = null;
-    }
-    if (writer) {
-      writer.releaseLock();
-      writer = null;
-    }
-    if (port) {
-      await port.close();
-      port = null;
+    if (device && device.opened) {
+      await device.releaseInterface(interfaceNumber);
+      await device.close();
     }
   } catch (error) {
-    message("Disconnect: " + error.message);
+    message("Disconnect error: " + error.message);
   }
 
-  $("connection").textContent = "● Not connected";
-  $("connection").style.color = "#fff";
-  $("connect").disabled = false;
-  $("disconnect").disabled = true;
-  $("save").disabled = true;
+  device = null;
+  buffer = "";
+  setConnected(false);
   message("Arduino disconnected.");
 }
 
